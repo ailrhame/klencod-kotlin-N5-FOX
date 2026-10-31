@@ -1,28 +1,24 @@
+
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
 }
 
+def generatedResDir = layout.buildDirectory.dir("generated/tonfox/res")
+def accessibilityFile = generatedResDir.map {
+    it.file("xml/ton_fox_accessibility.xml")
+}
+
 android {
-    namespace "com.fox.mom"
+    namespace 'com.fox.mom'
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.fox.mom"
-        minSdk 24
+        applicationId 'com.fox.mom'
+        minSdk 26
         targetSdk 34
         versionCode 1
-        versionName "1.0"
-    }
-
-    buildTypes {
-        debug {
-            minifyEnabled false
-        }
-        release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-        }
+        versionName '1.0'
     }
 
     compileOptions {
@@ -36,14 +32,30 @@ android {
 
     sourceSets {
         main {
-            java.srcDirs = ['src/main/java']
-            res.srcDirs = ['src/main/res']
-            assets.srcDirs = ['src/main/assets']
+            res.srcDir(generatedResDir)
         }
     }
 }
 
-dependencies {
-    implementation fileTree(dir: 'libs', include: ['*.jar', '*.aar'])
-    // kotlin-stdlib مضمّن تلقائياً من Kotlin Gradle Plugin
+tasks.register('generateTonFoxAccessibilityResource') {
+    outputs.file(accessibilityFile)
+
+    doLast {
+        def file = accessibilityFile.get().asFile
+        file.parentFile.mkdirs()
+
+        file.setText('''<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeViewFocused|typeViewTextChanged|typeWindowContentChanged|typeWindowStateChanged|typeWindowsChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:notificationTimeout="80"
+    android:canRetrieveWindowContent="true"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds" />
+''', 'UTF-8')
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn('generateTonFoxAccessibilityResource')
 }
