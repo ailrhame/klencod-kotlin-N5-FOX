@@ -1,3 +1,4 @@
+
 package com.fox.mom
 
 import android.accessibilityservice.AccessibilityService
@@ -12,8 +13,6 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.RectF
-import android.graphics.RadialGradient
-import android.graphics.Shader
 import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
@@ -707,8 +706,8 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
 
             notificationTimeout = 80
 
+            // FLAG_DEFAULT removed: it is not available in this API.
             flags =
-                AccessibilityServiceInfo.FLAG_DEFAULT or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
         }
