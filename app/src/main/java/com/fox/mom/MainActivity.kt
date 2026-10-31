@@ -1,6 +1,7 @@
 package com.fox.mom
 
 import android.accessibilityservice.AccessibilityService
+import android.animation.ValueAnimator
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Activity
 import android.content.ClipData
@@ -27,6 +28,8 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewOutlineProvider
+import android.view.animation.DecelerateInterpolator
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -46,6 +49,10 @@ private const val PREFS_NAME = "n5_fox_preferences"
 private const val PREF_COLOR = "lens_color_index"
 private const val PREF_SIZE = "lens_size_dp"
 private const val PREF_OPACITY = "lens_opacity"
+private const val PREF_IDLE_OPACITY = "lens_idle_opacity"
+private const val PREF_SNAP_EDGE = "lens_snap_edge"
+private const val PREF_POSITION_X = "lens_position_x"
+private const val PREF_POSITION_Y = "lens_position_y"
 private const val PREF_AUTO_COLOR = "lens_auto_color"
 private const val PREF_ONBOARDING_DONE = "onboarding_done"
 
@@ -223,13 +230,35 @@ class MainActivity : Activity() {
         addSpace(page, 22)
         page.addView(makeText("إعدادات الدائرة", 20f, Color.WHITE, true))
         addSpace(page, 6)
-        addSeekControl(page, "حجم الدائرة", 40, 88, preferences.getInt(PREF_SIZE, 58), "dp") { value ->
+        addSeekControl(page, "حجم الدائرة", 40, 100, preferences.getInt(PREF_SIZE, 62), "dp") { value ->
             preferences.edit().putInt(PREF_SIZE, value).apply()
         }
         addSpace(page, 8)
-        addSeekControl(page, "الشفافية أثناء الاستخدام", 20, 100, preferences.getInt(PREF_OPACITY, 92), "%") { value ->
+        addSeekControl(page, "الشفافية أثناء الاستخدام", 20, 100, preferences.getInt(PREF_OPACITY, 96), "%") { value ->
             preferences.edit().putInt(PREF_OPACITY, value).apply()
         }
+        addSpace(page, 8)
+        addSeekControl(page, "الشفافية عند عدم الاستخدام", 10, 80, preferences.getInt(PREF_IDLE_OPACITY, 38), "%") { value ->
+            preferences.edit().putInt(PREF_IDLE_OPACITY, value).apply()
+        }
+        addSpace(page, 8)
+        val snapButton = makeButton("", Color.rgb(92, 101, 153), Color.WHITE)
+        page.addView(snapButton)
+        fun updateSnapButton() {
+            val enabled = preferences.getBoolean(PREF_SNAP_EDGE, true)
+            snapButton.text = if (enabled) "الالتصاق الذكي بحافة الشاشة: مفعّل ✓" else "الالتصاق الذكي بحافة الشاشة: متوقف"
+        }
+        updateSnapButton()
+        snapButton.setOnClickListener {
+            val enabled = !preferences.getBoolean(PREF_SNAP_EDGE, true)
+            preferences.edit().putBoolean(PREF_SNAP_EDGE, enabled).apply()
+            updateSnapButton()
+        }
+        addSpace(page, 7)
+        page.addView(makeText(
+            "اسحب الدائرة لتغيير مكانها. عند تركها ستلتصق بأقرب حافة إذا كان الخيار مفعّلاً. اضغط للتحويل، واضغط مطولاً للتراجع.",
+            12f, Color.LTGRAY, false
+        ))
 
         addSpace(page, 24)
         page.addView(makeText("جرّب التحويل الآن", 20f, Color.WHITE, true))
@@ -484,47 +513,98 @@ private class LensVisual(
     primaryColor: Int,
     secondaryColor: Int
 ) : View(context) {
+
     var primary: Int = primaryColor
         set(value) { field = value; invalidate() }
     var secondary: Int = secondaryColor
         set(value) { field = value; invalidate() }
 
-    private val density = resources.displayMetrics.density
-    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+    private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val shinePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val clipPath = android.graphics.Path()
 
     init {
-        setLayerType(View.LAYER_TYPE_SOFTWARE, null)
-        setBackgroundColor(Color.TRANSPARENT)
+        // The background itself is an oval. The explicit circular clip below
+        // guarantees that the four corners of the overlay remain fully transparent.
+        background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.TRANSPARENT)
+        }
+        outlineProvider = ViewOutlineProvider.BACKGROUND
+        clipToOutline = true
+        setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        isClickable = true
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val side = min(width, height).toFloat()
+        if (side <= 0f) return
+
         val cx = width / 2f
         val cy = height / 2f
-        val radius = side * 0.39f
+        val outerRadius = side * 0.495f
+        val bodyRadius = side * 0.435f
 
+        clipPath.reset()
+        clipPath.addCircle(cx, cy, outerRadius, android.graphics.Path.Direction.CW)
+        val save = canvas.save()
+        canvas.clipPath(clipPath)
+
+        // A circular radial glow replaces shadow layers, which can reveal
+        // rectangular layer edges on some Android skins.
         glowPaint.style = Paint.Style.FILL
-        glowPaint.color = primary
-        glowPaint.setShadowLayer(13f * density, 0f, 0f, primary)
-        canvas.drawCircle(cx, cy, radius * 0.96f, glowPaint)
-        glowPaint.clearShadowLayer()
+        glowPaint.shader = android.graphics.RadialGradient(
+            cx, cy, outerRadius,
+            intArrayOf(
+                withAlpha(secondary, 70),
+                withAlpha(primary, 92),
+                withAlpha(primary, 18),
+                Color.TRANSPARENT
+            ),
+            floatArrayOf(0f, 0.62f, 0.88f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawCircle(cx, cy, outerRadius, glowPaint)
+        glowPaint.shader = null
 
         fillPaint.style = Paint.Style.FILL
         fillPaint.shader = LinearGradient(
-            cx - radius, cy - radius, cx + radius, cy + radius,
+            cx - bodyRadius, cy - bodyRadius,
+            cx + bodyRadius, cy + bodyRadius,
             primary, secondary, Shader.TileMode.CLAMP
         )
-        canvas.drawCircle(cx, cy, radius * 0.91f, fillPaint)
+        canvas.drawCircle(cx, cy, bodyRadius, fillPaint)
         fillPaint.shader = null
 
+        // Soft glass highlight, still clipped to the circular silhouette.
+        shinePaint.style = Paint.Style.FILL
+        shinePaint.shader = LinearGradient(
+            cx, cy - bodyRadius,
+            cx, cy + bodyRadius * 0.20f,
+            withAlpha(Color.WHITE, 105),
+            Color.TRANSPARENT,
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawCircle(cx, cy, bodyRadius * 0.91f, shinePaint)
+        shinePaint.shader = null
+
         ringPaint.style = Paint.Style.STROKE
-        ringPaint.strokeWidth = 2f * density
-        ringPaint.color = Color.argb(185, 255, 255, 255)
-        canvas.drawCircle(cx, cy, radius * 0.91f, ringPaint)
+        ringPaint.strokeWidth = max(1.2f, side * 0.027f)
+        ringPaint.color = Color.argb(215, 255, 255, 255)
+        canvas.drawCircle(cx, cy, bodyRadius * 0.96f, ringPaint)
+
+        ringPaint.strokeWidth = max(0.8f, side * 0.012f)
+        ringPaint.color = withAlpha(Color.WHITE, 95)
+        canvas.drawCircle(cx, cy, bodyRadius * 0.83f, ringPaint)
+
+        canvas.restoreToCount(save)
     }
+
+    private fun withAlpha(color: Int, alpha: Int): Int =
+        Color.argb(alpha.coerceIn(0, 255), Color.red(color), Color.green(color), Color.blue(color))
 }
 
 class TonFoxLensAccessibilityService : AccessibilityService() {
@@ -541,6 +621,7 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
     private var initialWindowY = 0
     private var movingLens = false
     private var longPressTriggered = false
+    private var snapAnimator: ValueAnimator? = null
     private val touchSlop by lazy { ViewConfiguration.get(this).scaledTouchSlop }
 
     private data class UndoSnapshot(val before: String, val after: String)
@@ -662,23 +743,30 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
         view.setOnTouchListener { touchedView, event -> handleLensTouch(touchedView, event) }
 
         val prefs = preferences ?: getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val size = prefs.getInt(PREF_SIZE, 58).coerceIn(40, 88)
+        val size = prefs.getInt(PREF_SIZE, 62).coerceIn(40, 100)
         val params = WindowManager.LayoutParams(
             dp(size), dp(size),
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.BOTTOM or Gravity.END
-            x = dp(16)
-            y = dp(270)
+            gravity = Gravity.BOTTOM or Gravity.RIGHT
+            alpha = 1f
+            dimAmount = 0f
+            windowAnimations = 0
+            val maxX = (resources.displayMetrics.widthPixels - width).coerceAtLeast(0)
+            val maxY = (resources.displayMetrics.heightPixels - height).coerceAtLeast(0)
+            x = prefs.getInt(PREF_POSITION_X, dp(16)).coerceIn(0, maxX)
+            y = prefs.getInt(PREF_POSITION_Y, dp(270)).coerceIn(0, maxY)
         }
 
         try {
             manager.addView(view, params)
             lensView = view
             lensParams = params
-            view.alpha = configuredOpacity() * 0.56f
+            view.alpha = idleOpacity()
         } catch (_: Exception) {
             lensView = null
             lensParams = null
@@ -692,18 +780,27 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
         view.primary = colors.first
         view.secondary = colors.second
         val prefs = preferences ?: return
-        val size = dp(prefs.getInt(PREF_SIZE, 58).coerceIn(40, 88))
+        val size = dp(prefs.getInt(PREF_SIZE, 62).coerceIn(40, 100))
         if (params.width != size || params.height != size) {
             params.width = size
             params.height = size
+            val metrics = resources.displayMetrics
+            params.x = params.x.coerceIn(0, (metrics.widthPixels - size).coerceAtLeast(0))
+            params.y = params.y.coerceIn(0, (metrics.heightPixels - size).coerceAtLeast(0))
             try { windowManager?.updateViewLayout(view, params) } catch (_: Exception) { }
+            persistLensPosition(params)
         }
-        if (!view.isPressed) view.alpha = configuredOpacity() * 0.56f
+        if (!view.isPressed && !movingLens) view.alpha = idleOpacity()
     }
 
     private fun configuredOpacity(): Float {
         val prefs = preferences ?: getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getInt(PREF_OPACITY, 92).coerceIn(20, 100) / 100f
+        return prefs.getInt(PREF_OPACITY, 96).coerceIn(20, 100) / 100f
+    }
+
+    private fun idleOpacity(): Float {
+        val prefs = preferences ?: getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getInt(PREF_IDLE_OPACITY, 38).coerceIn(10, 80) / 100f
     }
 
     private fun handleLensTouch(view: View, event: MotionEvent): Boolean {
@@ -743,13 +840,19 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
                 handler.removeCallbacks(longPressRunnable)
                 if (!movingLens && !longPressTriggered) {
                     if (undoSnapshot != null) undoLastConversion() else convertFocusedText()
+                } else if (movingLens) {
+                    snapToNearestEdge()
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                 }
+                movingLens = false
                 fadeLensSoon()
                 return true
             }
 
             MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(longPressRunnable)
+                if (movingLens) snapToNearestEdge()
+                movingLens = false
                 fadeLensSoon()
                 return true
             }
@@ -761,12 +864,63 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
         val view = lensView ?: return
         val params = lensParams ?: return
         val metrics = resources.displayMetrics
-        val maxX = max(0, metrics.widthPixels - params.width)
-        val maxY = max(0, metrics.heightPixels - params.height)
+        // With END|BOTTOM gravity, x/y are offsets from the right/bottom edges.
+        val maxX = (metrics.widthPixels - params.width).coerceAtLeast(0)
+        val maxY = (metrics.heightPixels - params.height).coerceAtLeast(0)
         params.x = (initialWindowX - deltaX.roundToInt()).coerceIn(0, maxX)
         params.y = (initialWindowY - deltaY.roundToInt()).coerceIn(0, maxY)
         try { windowManager?.updateViewLayout(view, params) } catch (_: Exception) { }
         view.alpha = configuredOpacity()
+    }
+
+    private fun snapToNearestEdge() {
+        val view = lensView ?: return
+        val params = lensParams ?: return
+        val prefs = preferences ?: return
+        val metrics = resources.displayMetrics
+        val maxX = (metrics.widthPixels - params.width).coerceAtLeast(0)
+        val maxY = (metrics.heightPixels - params.height).coerceAtLeast(0)
+        params.y = params.y.coerceIn(0, maxY)
+
+        if (!prefs.getBoolean(PREF_SNAP_EDGE, true)) {
+            persistLensPosition(params)
+            return
+        }
+
+        val centerFromLeft = metrics.widthPixels - params.x - params.width / 2f
+        val edgeMargin = dp(6)
+        val targetX = if (centerFromLeft < metrics.widthPixels / 2f) {
+            (maxX - edgeMargin).coerceAtLeast(0)
+        } else {
+            edgeMargin.coerceAtMost(maxX)
+        }
+        snapAnimator?.cancel()
+        val animator = ValueAnimator.ofInt(params.x, targetX).apply {
+            duration = 190L
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { animation ->
+                params.x = (animation.animatedValue as Int).coerceIn(0, maxX)
+                try { windowManager?.updateViewLayout(view, params) } catch (_: Exception) { }
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    persistLensPosition(params)
+                    snapAnimator = null
+                }
+                override fun onAnimationCancel(animation: android.animation.Animator) {
+                    snapAnimator = null
+                }
+            })
+        }
+        snapAnimator = animator
+        animator.start()
+    }
+
+    private fun persistLensPosition(params: WindowManager.LayoutParams) {
+        preferences?.edit()
+            ?.putInt(PREF_POSITION_X, params.x)
+            ?.putInt(PREF_POSITION_Y, params.y)
+            ?.apply()
     }
 
     private fun pulseLens(view: View) {
@@ -787,13 +941,16 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
 
     private fun fadeLensToIdle() {
         val view = lensView ?: return
-        view.animate().alpha(configuredOpacity() * 0.56f).setDuration(260).start()
+        view.animate().alpha(idleOpacity()).setDuration(300).start()
     }
 
     private fun hideLens() {
         handler.removeCallbacks(fadeRunnable)
         handler.removeCallbacks(longPressRunnable)
+        snapAnimator?.cancel()
+        snapAnimator = null
         val view = lensView ?: return
+        lensParams?.let { persistLensPosition(it) }
         try { windowManager?.removeView(view) } catch (_: Exception) { }
         lensView = null
         lensParams = null
