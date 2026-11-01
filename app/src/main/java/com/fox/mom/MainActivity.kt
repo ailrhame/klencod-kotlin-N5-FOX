@@ -1,24 +1,30 @@
 package com.fox.mom
 
 import android.accessibilityservice.AccessibilityService
-import android.animation.ValueAnimator
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
-import android.content.SharedPreferences
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -40,6 +46,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -55,6 +62,7 @@ private const val PREF_POSITION_X = "lens_position_x"
 private const val PREF_POSITION_Y = "lens_position_y"
 private const val PREF_AUTO_COLOR = "lens_auto_color"
 private const val PREF_ONBOARDING_DONE = "onboarding_done"
+private const val PREF_CUSTOM_LENS_URI = "custom_lens_image_uri"
 
 private data class FoxPalette(
     val name: String,
@@ -129,8 +137,10 @@ private object FrancoConverter {
         val result = StringBuilder(input.length)
         var index = 0
         while (index < input.length) {
-            val remaining = input.substring(index)
-            val token = francoTokens.firstOrNull { remaining.startsWith(it.first, ignoreCase = true) }
+            // regionMatches avoids allocating a new substring for every character.
+            val token = francoTokens.firstOrNull {
+                input.regionMatches(index, it.first, 0, it.first.length, ignoreCase = true)
+            }
             if (token != null) {
                 result.append(token.second)
                 index += token.first.length
@@ -139,11 +149,7 @@ private object FrancoConverter {
 
             val current = input[index]
             val mapped = francoSingle[current.lowercaseChar()]
-            if (mapped != null) {
-                result.append(mapped)
-            } else {
-                result.append(current)
-            }
+            if (mapped != null) result.append(mapped) else result.append(current)
             index++
         }
         return result.toString()
@@ -156,7 +162,10 @@ class MainActivity : Activity() {
     private lateinit var previewInput: EditText
     private lateinit var previewOutput: TextView
     private lateinit var paletteGrid: LinearLayout
+    private lateinit var imageStatusText: TextView
     private lateinit var preferences: SharedPreferences
+
+    private val imagePickerRequest = 7451
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
 
@@ -211,6 +220,34 @@ class MainActivity : Activity() {
         paletteGrid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(paletteGrid)
         buildPaletteGrid()
+
+        // Custom circular image section.
+        addSpace(page, 20)
+        page.addView(makeText("عدستك بصورة من الاستوديو", 20f, Color.WHITE, true))
+        page.addView(makeText(
+            "اختر صورة، وسيتم عرضها داخل العدسة بقصّ دائري تلقائي.",
+            12f, Color.LTGRAY, false
+        ))
+        addSpace(page, 9)
+        imageStatusText = makeText("", 12f, Color.rgb(190, 205, 235), false)
+        imageStatusText.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+        page.addView(imageStatusText)
+        val chooseImageButton = makeButton(
+            "اختيار صورة من الاستوديو",
+            Color.rgb(255, 170, 75),
+            Color.BLACK
+        )
+        page.addView(chooseImageButton)
+        chooseImageButton.setOnClickListener { openLensImagePicker() }
+        addSpace(page, 7)
+        val removeImageButton = makeButton(
+            "إزالة الصورة والعودة إلى اللون",
+            Color.rgb(65, 70, 100),
+            Color.WHITE
+        )
+        page.addView(removeImageButton)
+        removeImageButton.setOnClickListener { removeCustomLensImage() }
+        updateCustomImageStatus()
 
         addSpace(page, 16)
         val autoButton = makeButton("", Color.rgb(92, 101, 153), Color.WHITE)
@@ -331,6 +368,79 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if (::statusText.isInitialized) updateStatus()
+        if (::imageStatusText.isInitialized) updateCustomImageStatus()
+    }
+
+    private fun openLensImagePicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        }
+        try {
+            startActivityForResult(intent, imagePickerRequest)
+        } catch (_: Exception) {
+            toast("تعذر فتح الاستوديو")
+        }
+    }
+
+    @Deprecated("Deprecated by Android, retained for compatibility with the current project structure")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != imagePickerRequest || resultCode != RESULT_OK) return
+
+        val uri = data?.data ?: run {
+            toast("لم يتم اختيار صورة")
+            return
+        }
+
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+            preferences.edit().putString(PREF_CUSTOM_LENS_URI, uri.toString()).apply()
+            updateCustomImageStatus()
+            toast("تم حفظ صورة العدسة. ستظهر عند فتح لوحة المفاتيح.")
+        } catch (_: SecurityException) {
+            // Some document providers return a temporary grant only.
+            try {
+                preferences.edit().putString(PREF_CUSTOM_LENS_URI, uri.toString()).apply()
+                updateCustomImageStatus()
+                toast("تم اختيار الصورة، لكن قد تحتاج إلى اختيارها مجدداً بعد إعادة تشغيل الهاتف")
+            } catch (_: Exception) {
+                toast("تعذر حفظ الصورة")
+            }
+        } catch (_: Exception) {
+            toast("تعذر حفظ الصورة")
+        }
+    }
+
+    private fun removeCustomLensImage() {
+        val oldUri = preferences.getString(PREF_CUSTOM_LENS_URI, null)
+        if (oldUri != null) {
+            try {
+                contentResolver.releasePersistableUriPermission(
+                    Uri.parse(oldUri),
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+                // The grant may have been temporary or already revoked.
+            }
+        }
+        preferences.edit().remove(PREF_CUSTOM_LENS_URI).apply()
+        updateCustomImageStatus()
+        toast("تمت إزالة الصورة والعودة إلى اللون المختار")
+    }
+
+    private fun updateCustomImageStatus() {
+        if (!::imageStatusText.isInitialized || !::preferences.isInitialized) return
+        val selected = !preferences.getString(PREF_CUSTOM_LENS_URI, null).isNullOrBlank()
+        imageStatusText.text = if (selected) {
+            "✓ توجد صورة مخصصة محفوظة للعدسة"
+        } else {
+            "لم تختر صورة بعد — ستستخدم العدسة اللون المحدد أعلاه"
+        }
     }
 
     private fun buildOnboarding(): LinearLayout {
@@ -518,16 +628,23 @@ private class LensVisual(
         set(value) { field = value; invalidate() }
     var secondary: Int = secondaryColor
         set(value) { field = value; invalidate() }
+    var customBitmap: Bitmap? = null
+        set(value) { field = value; invalidate() }
+    var processing: Boolean = false
+        set(value) { field = value; invalidate() }
 
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
     private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val shinePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val imagePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val imageMatrix = Matrix()
     private val clipPath = android.graphics.Path()
+    private val progressTrackPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val progressPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var loadingAngle = 0f
 
     init {
-        // The background itself is an oval. The explicit circular clip below
-        // guarantees that the four corners of the overlay remain fully transparent.
         background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(Color.TRANSPARENT)
@@ -553,8 +670,6 @@ private class LensVisual(
         val save = canvas.save()
         canvas.clipPath(clipPath)
 
-        // A circular radial glow replaces shadow layers, which can reveal
-        // rectangular layer edges on some Android skins.
         glowPaint.style = Paint.Style.FILL
         glowPaint.shader = android.graphics.RadialGradient(
             cx, cy, outerRadius,
@@ -579,12 +694,29 @@ private class LensVisual(
         canvas.drawCircle(cx, cy, bodyRadius, fillPaint)
         fillPaint.shader = null
 
-        // Soft glass highlight, still clipped to the circular silhouette.
+        // A center-cropped bitmap shader produces a true circular image mask.
+        customBitmap?.let { bitmap ->
+            val imageRadius = bodyRadius * 0.91f
+            val shader = BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+            val scale = max(
+                (imageRadius * 2f) / bitmap.width.toFloat(),
+                (imageRadius * 2f) / bitmap.height.toFloat()
+            )
+            val dx = cx - bitmap.width * scale / 2f
+            val dy = cy - bitmap.height * scale / 2f
+            imageMatrix.setScale(scale, scale)
+            imageMatrix.postTranslate(dx, dy)
+            shader.setLocalMatrix(imageMatrix)
+            imagePaint.shader = shader
+            canvas.drawCircle(cx, cy, imageRadius, imagePaint)
+            imagePaint.shader = null
+        }
+
         shinePaint.style = Paint.Style.FILL
         shinePaint.shader = LinearGradient(
             cx, cy - bodyRadius,
             cx, cy + bodyRadius * 0.20f,
-            withAlpha(Color.WHITE, 105),
+            withAlpha(Color.WHITE, if (customBitmap == null) 105 else 48),
             Color.TRANSPARENT,
             Shader.TileMode.CLAMP
         )
@@ -600,6 +732,23 @@ private class LensVisual(
         ringPaint.color = withAlpha(Color.WHITE, 95)
         canvas.drawCircle(cx, cy, bodyRadius * 0.83f, ringPaint)
 
+        if (processing) {
+            val radius = bodyRadius * 0.72f
+            val bounds = RectF(cx - radius, cy - radius, cx + radius, cy + radius)
+            progressTrackPaint.style = Paint.Style.STROKE
+            progressTrackPaint.strokeWidth = max(2.5f, side * 0.055f)
+            progressTrackPaint.color = Color.argb(95, 255, 255, 255)
+            canvas.drawArc(bounds, 0f, 360f, false, progressTrackPaint)
+
+            progressPaint.style = Paint.Style.STROKE
+            progressPaint.strokeCap = Paint.Cap.ROUND
+            progressPaint.strokeWidth = max(3f, side * 0.06f)
+            progressPaint.color = Color.WHITE
+            canvas.drawArc(bounds, loadingAngle, 92f, false, progressPaint)
+            loadingAngle = (loadingAngle + 13f) % 360f
+            postInvalidateDelayed(32L)
+        }
+
         canvas.restoreToCount(save)
     }
 
@@ -610,6 +759,9 @@ private class LensVisual(
 class TonFoxLensAccessibilityService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
+    private val conversionExecutor = Executors.newSingleThreadExecutor()
+    private val imageExecutor = Executors.newSingleThreadExecutor()
+
     private var windowManager: WindowManager? = null
     private var lensView: LensVisual? = null
     private var lensParams: WindowManager.LayoutParams? = null
@@ -621,6 +773,14 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
     private var initialWindowY = 0
     private var movingLens = false
     private var longPressTriggered = false
+    private var conversionRunning = false
+    @Volatile private var serviceDestroyed = false
+
+    private var customLensBitmap: Bitmap? = null
+    private var loadedImageUri: String? = null
+    private var requestedImageUri: String? = null
+    private var imageRequestToken = 0
+
     private var snapAnimator: ValueAnimator? = null
     private val touchSlop by lazy { ViewConfiguration.get(this).scaledTouchSlop }
 
@@ -629,18 +789,22 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
     private val updateRunnable = Runnable { synchronizeKeyboard() }
     private val fadeRunnable = Runnable { fadeLensToIdle() }
     private val longPressRunnable = Runnable {
-        if (!movingLens) {
+        if (!movingLens && !conversionRunning) {
             longPressTriggered = true
             undoLastConversion()
         }
     }
 
     private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-        handler.post { refreshLensAppearance() }
+        handler.post {
+            refreshLensAppearance()
+            requestCustomLensImage()
+        }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        serviceDestroyed = false
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         preferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).also {
             it.registerOnSharedPreferenceChangeListener(preferenceListener)
@@ -671,10 +835,19 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        serviceDestroyed = true
         handler.removeCallbacksAndMessages(null)
         preferences?.unregisterOnSharedPreferenceChangeListener(preferenceListener)
         hideLens()
+        conversionExecutor.shutdownNow()
+        imageExecutor.shutdownNow()
+        customLensBitmap?.recycleIfSafe()
+        customLensBitmap = null
         super.onDestroy()
+    }
+
+    private fun Bitmap.recycleIfSafe() {
+        if (!isRecycled) recycle()
     }
 
     private fun scheduleKeyboardCheck() {
@@ -767,6 +940,7 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
             lensView = view
             lensParams = params
             view.alpha = idleOpacity()
+            requestCustomLensImage()
         } catch (_: Exception) {
             lensView = null
             lensParams = null
@@ -790,7 +964,86 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
             try { windowManager?.updateViewLayout(view, params) } catch (_: Exception) { }
             persistLensPosition(params)
         }
-        if (!view.isPressed && !movingLens) view.alpha = idleOpacity()
+        if (!view.isPressed && !movingLens && !conversionRunning) view.alpha = idleOpacity()
+    }
+
+    private fun requestCustomLensImage() {
+        val prefs = preferences ?: return
+        val uriString = prefs.getString(PREF_CUSTOM_LENS_URI, null)
+
+        if (uriString.isNullOrBlank()) {
+            imageRequestToken++
+            requestedImageUri = null
+            loadedImageUri = null
+            customLensBitmap?.recycleIfSafe()
+            customLensBitmap = null
+            lensView?.customBitmap = null
+            return
+        }
+
+        if (loadedImageUri == uriString) {
+            lensView?.customBitmap = customLensBitmap
+            return
+        }
+        if (requestedImageUri == uriString) return
+
+        requestedImageUri = uriString
+        val token = ++imageRequestToken
+        try {
+            imageExecutor.execute {
+                val decoded = try {
+                    decodeCustomImage(Uri.parse(uriString))
+                } catch (_: Exception) {
+                    null
+                }
+
+                handler.post {
+                    if (serviceDestroyed || token != imageRequestToken) {
+                        decoded?.recycleIfSafe()
+                        return@post
+                    }
+                    val stillSelected = preferences?.getString(PREF_CUSTOM_LENS_URI, null)
+                    if (stillSelected != uriString) {
+                        decoded?.recycleIfSafe()
+                        return@post
+                    }
+
+                    requestedImageUri = null
+                    loadedImageUri = uriString
+                    customLensBitmap?.recycleIfSafe()
+                    customLensBitmap = decoded
+                    lensView?.customBitmap = decoded
+                    if (decoded == null) {
+                        showMessage("تعذر فتح الصورة؛ اختر صورة أخرى من الاستوديو")
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            requestedImageUri = null
+            showMessage("تعذر تحميل صورة العدسة")
+        }
+    }
+
+    private fun decodeCustomImage(uri: Uri): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, bounds)
+        } ?: return null
+
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        var sampleSize = 1
+        val largestSide = max(bounds.outWidth, bounds.outHeight)
+        while (largestSide / sampleSize > 768) sampleSize *= 2
+
+        val options = BitmapFactory.Options().apply {
+            inJustDecodeBounds = false
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        return contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, options)
+        }
     }
 
     private fun configuredOpacity(): Float {
@@ -810,6 +1063,10 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
                 val dy = event.y - view.height / 2f
                 if (dx * dx + dy * dy > (min(view.width, view.height) * 0.48f).let { it * it }) {
                     return false
+                }
+                if (conversionRunning) {
+                    showMessage("جارٍ التحويل، انتظر قليلاً")
+                    return true
                 }
                 movingLens = false
                 longPressTriggered = false
@@ -838,7 +1095,7 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
 
             MotionEvent.ACTION_UP -> {
                 handler.removeCallbacks(longPressRunnable)
-                if (!movingLens && !longPressTriggered) {
+                if (!movingLens && !longPressTriggered && !conversionRunning) {
                     if (undoSnapshot != null) undoLastConversion() else convertFocusedText()
                 } else if (movingLens) {
                     snapToNearestEdge()
@@ -864,7 +1121,6 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
         val view = lensView ?: return
         val params = lensParams ?: return
         val metrics = resources.displayMetrics
-        // With END|BOTTOM gravity, x/y are offsets from the right/bottom edges.
         val maxX = (metrics.widthPixels - params.width).coerceAtLeast(0)
         val maxY = (metrics.heightPixels - params.height).coerceAtLeast(0)
         params.x = (initialWindowX - deltaX.roundToInt()).coerceIn(0, maxX)
@@ -941,7 +1197,7 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
 
     private fun fadeLensToIdle() {
         val view = lensView ?: return
-        view.animate().alpha(idleOpacity()).setDuration(300).start()
+        if (!conversionRunning) view.animate().alpha(idleOpacity()).setDuration(300).start()
     }
 
     private fun hideLens() {
@@ -974,6 +1230,11 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
     }
 
     private fun convertFocusedText() {
+        if (conversionRunning) {
+            showMessage("هناك عملية تحويل قيد التنفيذ")
+            return
+        }
+
         try {
             val target = currentEditableNode()
             if (target == null) {
@@ -984,6 +1245,7 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
                 showMessage("لا يمكن تعديل حقول كلمات المرور")
                 return
             }
+
             val original = target.text?.toString().orEmpty()
             if (original.isEmpty()) {
                 showMessage("اكتب النص أولاً")
@@ -1001,31 +1263,98 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
             }
 
             val selectedText = original.substring(start, end)
-            val converted = if (FrancoConverter.hasArabic(selectedText)) {
-                FrancoConverter.toFranco(selectedText)
-            } else {
-                FrancoConverter.toArabic(selectedText)
-            }
-            if (converted == selectedText) {
-                showMessage("لم يتغير النص")
-                return
-            }
+            val targetPackage = target.packageName?.toString()
+            val targetViewId = target.viewIdResourceName
+            val targetClass = target.className?.toString()
 
-            val replacement = original.substring(0, start) + converted + original.substring(end)
-            if (setNodeText(target, replacement)) {
-                undoSnapshot = UndoSnapshot(original, replacement)
-                val cursor = (start + converted.length).coerceIn(0, replacement.length)
-                setNodeSelection(target, cursor)
-                showMessage(if (hasSelection) "تم تحويل الجزء المحدد" else "تم التحويل — اضغط ثانية أو مطولاً للتراجع")
-            } else {
-                showMessage("هذا الحقل لا يسمح بتعديل النص")
+            conversionRunning = true
+            lensView?.processing = true
+            lensView?.contentDescription = "N5 FOX: جارٍ تحويل النص"
+            lensView?.alpha = configuredOpacity()
+            showMessage("جارٍ تحويل النص... التطبيق يعمل")
+
+            conversionExecutor.execute {
+                val converted = try {
+                    if (FrancoConverter.hasArabic(selectedText)) {
+                        FrancoConverter.toFranco(selectedText)
+                    } else {
+                        FrancoConverter.toArabic(selectedText)
+                    }
+                } catch (_: Exception) {
+                    null
+                }
+
+                handler.post {
+                    if (serviceDestroyed) return@post
+                    try {
+                        if (converted == null) {
+                            showMessage("حدث خطأ أثناء التحويل")
+                            return@post
+                        }
+                        if (converted == selectedText) {
+                            showMessage("لم يتغير النص")
+                            return@post
+                        }
+
+                        val currentTarget = currentEditableNode()
+                        if (currentTarget == null) {
+                            showMessage("ارجع إلى حقل الكتابة وحاول مجدداً")
+                            return@post
+                        }
+
+                        val currentText = currentTarget.text?.toString().orEmpty()
+                        val sameTarget =
+                            currentTarget.packageName?.toString() == targetPackage &&
+                            currentTarget.className?.toString() == targetClass &&
+                            (targetViewId == null || currentTarget.viewIdResourceName == targetViewId)
+
+                        if (!sameTarget || currentText != original) {
+                            showMessage("تغيّر الحقل أو النص أثناء المعالجة؛ لم يتم تعديله")
+                            return@post
+                        }
+                        if (currentTarget.isPassword) {
+                            showMessage("لا يمكن تعديل حقول كلمات المرور")
+                            return@post
+                        }
+
+                        val replacement = original.substring(0, start) + converted + original.substring(end)
+                        if (setNodeText(currentTarget, replacement)) {
+                            undoSnapshot = UndoSnapshot(original, replacement)
+                            val cursor = (start + converted.length).coerceIn(0, replacement.length)
+                            setNodeSelection(currentTarget, cursor)
+                            showMessage(
+                                if (hasSelection) "تم تحويل الجزء المحدد بنجاح"
+                                else "تم التحويل بنجاح — اضغط للتراجع"
+                            )
+                        } else {
+                            showMessage("هذا الحقل لا يسمح بتعديل النص")
+                        }
+                    } catch (_: Exception) {
+                        showMessage("تعذر إكمال التحويل")
+                    } finally {
+                        conversionRunning = false
+                        lensView?.processing = false
+                        lensView?.contentDescription = "N5 FOX floating color circle"
+                        fadeLensSoon()
+                    }
+                }
             }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            conversionRunning = false
+            lensView?.processing = false
+            showMessage("تعذر بدء المعالجة؛ أعد فتح العدسة")
         } catch (_: Exception) {
-            showMessage("تعذر تحويل النص في هذا الحقل")
+            conversionRunning = false
+            lensView?.processing = false
+            showMessage("تعذر بدء التحويل")
         }
     }
 
     private fun undoLastConversion() {
+        if (conversionRunning) {
+            showMessage("انتظر حتى ينتهي التحويل")
+            return
+        }
         val snapshot = undoSnapshot ?: run {
             showMessage("لا يوجد تحويل للتراجع عنه")
             return
@@ -1070,8 +1399,11 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
     }
 
     private fun showMessage(message: String) {
+        if (serviceDestroyed) return
         handler.post {
-            Toast.makeText(applicationContext, message, Toast.LENGTH_SHORT).show()
+            if (!serviceDestroyed) {
+                Toast.makeText(applicationContext, message, Toast.LENGTH_SHORT).show()
+            }
         }
     }
 }
