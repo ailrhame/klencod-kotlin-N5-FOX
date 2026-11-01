@@ -370,7 +370,43 @@ class MainActivity : Activity() {
             "طريقة الاستخدام: افتح أي حقل كتابة، وستظهر الدائرة عند ظهور لوحة المفاتيح. اسحبها بإصبعك لتحريكها. اضغط مرة للتحويل، واضغط مرة ثانية أو اضغط مطولاً للتراجع.",
             12f, Color.LTGRAY, false
         ))
+
+        // Developer ownership footer.
+        addSpace(page, 28)
+        val rightsDivider = View(this).apply {
+            setBackgroundColor(Color.rgb(70, 75, 105))
+        }
+        page.addView(rightsDivider, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
+        ))
+        addSpace(page, 14)
+        val developerName = makeText("N5CR4", 18f, Color.rgb(255, 210, 105), true)
+        developerName.gravity = Gravity.CENTER
+        page.addView(developerName)
+        val developerRights = makeText("حقوق التطوير والملكية الفكرية محفوظة للمطور", 11f, Color.LTGRAY, false)
+        developerRights.gravity = Gravity.CENTER
+        page.addView(developerRights)
+        val copyright = makeText("© 2026 N5CR4 · جميع الحقوق محفوظة", 10f, Color.rgb(135, 145, 170), false)
+        copyright.gravity = Gravity.CENTER
+        page.addView(copyright)
+
+        // Tapping any part of the developer credits opens the Telegram profile.
+        listOf(developerName, developerRights, copyright).forEach { credit ->
+            credit.isClickable = true
+            credit.isFocusable = true
+            credit.setOnClickListener { openDeveloperTelegram() }
+        }
+        addSpace(page, 8)
         updateStatus()
+    }
+
+    private fun openDeveloperTelegram() {
+        val telegramUrl = "https://t.me/N5CR4"
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(telegramUrl)))
+        } catch (_: Exception) {
+            toast("تعذر فتح تلجرام")
+        }
     }
 
     override fun onResume() {
