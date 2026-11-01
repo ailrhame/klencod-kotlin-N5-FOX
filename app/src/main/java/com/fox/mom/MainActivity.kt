@@ -63,6 +63,7 @@ private const val PREF_POSITION_Y = "lens_position_y"
 private const val PREF_AUTO_COLOR = "lens_auto_color"
 private const val PREF_ONBOARDING_DONE = "onboarding_done"
 private const val PREF_CUSTOM_LENS_URI = "custom_lens_image_uri"
+private const val PREF_CUSTOM_IMAGE_ZOOM = "custom_lens_image_zoom"
 
 private data class FoxPalette(
     val name: String,
@@ -240,6 +241,13 @@ class MainActivity : Activity() {
         page.addView(chooseImageButton)
         chooseImageButton.setOnClickListener { openLensImagePicker() }
         addSpace(page, 7)
+        addSeekControl(
+            page, "تكبير الصورة داخل الدائرة", 100, 250,
+            preferences.getInt(PREF_CUSTOM_IMAGE_ZOOM, 100), "%"
+        ) { value ->
+            preferences.edit().putInt(PREF_CUSTOM_IMAGE_ZOOM, value).apply()
+        }
+        addSpace(page, 7)
         val removeImageButton = makeButton(
             "إزالة الصورة والعودة إلى اللون",
             Color.rgb(65, 70, 100),
@@ -372,72 +380,70 @@ class MainActivity : Activity() {
     }
 
     private fun openLensImagePicker() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        val primary = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "image/*"
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         }
         try {
-            startActivityForResult(intent, imagePickerRequest)
+            startActivityForResult(primary, imagePickerRequest)
         } catch (_: Exception) {
-            toast("تعذر فتح الاستوديو")
+            try {
+                val fallback = Intent(Intent.ACTION_GET_CONTENT).apply {
+                    type = "image/*"
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                }
+                startActivityForResult(Intent.createChooser(fallback, "اختر صورة العدسة"), imagePickerRequest)
+            } catch (_: Exception) {
+                toast("لا يوجد تطبيق متاح لاختيار الصور")
+            }
         }
     }
 
-    @Deprecated("Deprecated by Android, retained for compatibility with the current project structure")
+    @Deprecated("Deprecated by Android, retained for compatibility")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != imagePickerRequest || resultCode != RESULT_OK) return
-
         val uri = data?.data ?: run {
             toast("لم يتم اختيار صورة")
             return
         }
-
         try {
-            contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
-            preferences.edit().putString(PREF_CUSTOM_LENS_URI, uri.toString()).apply()
-            updateCustomImageStatus()
-            toast("تم حفظ صورة العدسة. ستظهر عند فتح لوحة المفاتيح.")
-        } catch (_: SecurityException) {
-            // Some document providers return a temporary grant only.
-            try {
-                preferences.edit().putString(PREF_CUSTOM_LENS_URI, uri.toString()).apply()
-                updateCustomImageStatus()
-                toast("تم اختيار الصورة، لكن قد تحتاج إلى اختيارها مجدداً بعد إعادة تشغيل الهاتف")
-            } catch (_: Exception) {
-                toast("تعذر حفظ الصورة")
+            // Copy into private app storage. This avoids temporary gallery URI permissions
+            // and works with providers that do not support persistable grants.
+            val destination = java.io.File(filesDir, "n5_fox_custom_lens.jpg")
+            val input = contentResolver.openInputStream(uri)
+                ?: throw IllegalStateException("تعذر قراءة الصورة")
+            input.use { source ->
+                destination.outputStream().use { output -> source.copyTo(output) }
             }
-        } catch (_: Exception) {
-            toast("تعذر حفظ الصورة")
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(destination.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0 || destination.length() <= 0L) {
+                destination.delete()
+                throw IllegalArgumentException("ملف الصورة غير صالح")
+            }
+            preferences.edit().putString(PREF_CUSTOM_LENS_URI, destination.absolutePath).apply()
+            updateCustomImageStatus()
+            toast("تم حفظ الصورة داخل التطبيق")
+        } catch (e: Exception) {
+            toast("تعذر فتح الصورة: ${e.localizedMessage ?: "صيغة غير مدعومة"}")
         }
     }
 
     private fun removeCustomLensImage() {
-        val oldUri = preferences.getString(PREF_CUSTOM_LENS_URI, null)
-        if (oldUri != null) {
-            try {
-                contentResolver.releasePersistableUriPermission(
-                    Uri.parse(oldUri),
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: Exception) {
-                // The grant may have been temporary or already revoked.
-            }
-        }
         preferences.edit().remove(PREF_CUSTOM_LENS_URI).apply()
+        try { java.io.File(filesDir, "n5_fox_custom_lens.jpg").delete() } catch (_: Exception) { }
         updateCustomImageStatus()
         toast("تمت إزالة الصورة والعودة إلى اللون المختار")
     }
 
     private fun updateCustomImageStatus() {
         if (!::imageStatusText.isInitialized || !::preferences.isInitialized) return
-        val selected = !preferences.getString(PREF_CUSTOM_LENS_URI, null).isNullOrBlank()
+        val path = preferences.getString(PREF_CUSTOM_LENS_URI, null)
+        val selected = !path.isNullOrBlank() && java.io.File(path).exists()
         imageStatusText.text = if (selected) {
-            "✓ توجد صورة مخصصة محفوظة للعدسة"
+            "✓ الصورة محفوظة — يمكنك ضبط تكبيرها من شريط التحكم"
         } else {
             "لم تختر صورة بعد — ستستخدم العدسة اللون المحدد أعلاه"
         }
@@ -698,10 +704,13 @@ private class LensVisual(
         customBitmap?.let { bitmap ->
             val imageRadius = bodyRadius * 0.91f
             val shader = BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-            val scale = max(
+            val baseScale = max(
                 (imageRadius * 2f) / bitmap.width.toFloat(),
                 (imageRadius * 2f) / bitmap.height.toFloat()
             )
+            val zoom = (context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getInt(PREF_CUSTOM_IMAGE_ZOOM, 100).coerceIn(100, 250)) / 100f
+            val scale = baseScale * zoom
             val dx = cx - bitmap.width * scale / 2f
             val dy = cy - bitmap.height * scale / 2f
             imageMatrix.setScale(scale, scale)
@@ -969,9 +978,9 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
 
     private fun requestCustomLensImage() {
         val prefs = preferences ?: return
-        val uriString = prefs.getString(PREF_CUSTOM_LENS_URI, null)
+        val imagePath = prefs.getString(PREF_CUSTOM_LENS_URI, null)
 
-        if (uriString.isNullOrBlank()) {
+        if (imagePath.isNullOrBlank() || !java.io.File(imagePath).exists()) {
             imageRequestToken++
             requestedImageUri = null
             loadedImageUri = null
@@ -981,18 +990,18 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
             return
         }
 
-        if (loadedImageUri == uriString) {
+        if (loadedImageUri == imagePath) {
             lensView?.customBitmap = customLensBitmap
             return
         }
-        if (requestedImageUri == uriString) return
+        if (requestedImageUri == imagePath) return
 
-        requestedImageUri = uriString
+        requestedImageUri = imagePath
         val token = ++imageRequestToken
         try {
             imageExecutor.execute {
                 val decoded = try {
-                    decodeCustomImage(Uri.parse(uriString))
+                    decodeCustomImageFile(imagePath)
                 } catch (_: Exception) {
                     null
                 }
@@ -1003,13 +1012,13 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
                         return@post
                     }
                     val stillSelected = preferences?.getString(PREF_CUSTOM_LENS_URI, null)
-                    if (stillSelected != uriString) {
+                    if (stillSelected != imagePath) {
                         decoded?.recycleIfSafe()
                         return@post
                     }
 
                     requestedImageUri = null
-                    loadedImageUri = uriString
+                    loadedImageUri = imagePath
                     customLensBitmap?.recycleIfSafe()
                     customLensBitmap = decoded
                     lensView?.customBitmap = decoded
@@ -1024,26 +1033,21 @@ class TonFoxLensAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun decodeCustomImage(uri: Uri): Bitmap? {
+    private fun decodeCustomImageFile(path: String): Bitmap? {
+        val file = java.io.File(path)
+        if (!file.exists() || !file.canRead()) return null
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        contentResolver.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(it, null, bounds)
-        } ?: return null
-
+        BitmapFactory.decodeFile(path, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-
         var sampleSize = 1
         val largestSide = max(bounds.outWidth, bounds.outHeight)
-        while (largestSide / sampleSize > 768) sampleSize *= 2
-
+        while (largestSide / sampleSize > 1024) sampleSize *= 2
         val options = BitmapFactory.Options().apply {
             inJustDecodeBounds = false
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
-        return contentResolver.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(it, null, options)
-        }
+        return BitmapFactory.decodeFile(path, options)
     }
 
     private fun configuredOpacity(): Float {
